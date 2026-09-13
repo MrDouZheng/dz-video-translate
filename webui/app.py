@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import warnings
 
 with warnings.catch_warnings():
@@ -17,6 +18,7 @@ with warnings.catch_warnings():
     import cgi
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -262,7 +264,40 @@ def escape_ass(text: str) -> str:
     return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
 
+class JobCancelled(RuntimeError):
+    """任务被用户主动停止。"""
+
+
+def terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            process.terminate()
+    except OSError:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def run_command(cmd: list[str], cwd: Path | None, job: "Job", stage: str, log_path: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    job.check_cancelled()
     job.update(stage, job.progress, "正在执行：" + Path(cmd[0]).name)
     with log_path.open("a", encoding="utf-8", errors="replace") as log:
         log.write("\n$ " + subprocess.list2cmdline(cmd) + "\n")
@@ -278,14 +313,41 @@ def run_command(cmd: list[str], cwd: Path | None, job: "Job", stage: str, log_pa
         )
         output_lines: list[str] = []
         assert process.stdout is not None
-        for line in process.stdout:
-            line = line.rstrip()
-            log.write(line + "\n")
-            log.flush()
-            if line:
-                output_lines.append(line)
-                job.append_log(line)
-        returncode = process.wait()
+        output_queue: queue.Queue[str] = queue.Queue()
+        reader_done = threading.Event()
+
+        def read_output() -> None:
+            try:
+                for value in process.stdout:
+                    output_queue.put(value)
+            finally:
+                reader_done.set()
+
+        reader = threading.Thread(target=read_output, name=f"output-reader-{process.pid}", daemon=True)
+        reader.start()
+        try:
+            while True:
+                job.check_cancelled()
+                try:
+                    line = output_queue.get(timeout=0.25)
+                except queue.Empty:
+                    if process.poll() is not None and reader_done.is_set() and output_queue.empty():
+                        break
+                    continue
+                line = line.rstrip()
+                log.write(line + "\n")
+                log.flush()
+                if line:
+                    output_lines.append(line)
+                    job.append_log(line)
+            returncode = process.wait()
+        except JobCancelled:
+            terminate_process(process)
+            raise
+        finally:
+            if job.cancel_event.is_set():
+                terminate_process(process)
+            reader.join(timeout=2)
     result = subprocess.CompletedProcess(cmd, returncode, "\n".join(output_lines), "")
     if check and returncode != 0:
         raise RuntimeError(f"{Path(cmd[0]).name} 执行失败，退出码 {returncode}")
@@ -303,6 +365,7 @@ class LocalLlama:
         self.base_url = f"http://127.0.0.1:{self.port}"
 
     def start(self) -> None:
+        self.job.check_cancelled()
         server = executable(str(CONFIG.get("llama_server", "")), ("llama-server.exe", "llama-server"))
         if not server:
             raise RuntimeError("找不到 llama-server.exe，请在 config.json 配置 llama_server")
@@ -335,7 +398,9 @@ class LocalLlama:
         deadline = time.time() + 240
         last_error = ""
         while time.time() < deadline:
-            if self.process.poll() is not None:
+            self.job.check_cancelled()
+            process = self.process
+            if process is None or process.poll() is not None:
                 raise RuntimeError("llama-server 启动失败，请查看任务日志；常见原因是显存不足或模型格式不兼容")
             try:
                 with urlopen(self.base_url + "/health", timeout=2) as response:
@@ -351,6 +416,7 @@ class LocalLlama:
         results: list[str] = []
         batch_size = max(1, int(CONFIG.get("translation_batch", 16)))
         for start in range(0, len(entries), batch_size):
+            self.job.check_cancelled()
             batch = entries[start:start + batch_size]
             payload = [{"id": index, "text": item["text"]} for index, item in enumerate(batch)]
             system = (
@@ -378,6 +444,7 @@ class LocalLlama:
         return results
 
     def _request(self, payload: dict[str, Any]) -> str:
+        self.job.check_cancelled()
         request = Request(
             self.base_url + "/v1/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -388,9 +455,11 @@ class LocalLlama:
             with urlopen(request, timeout=600) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
+            self.job.check_cancelled()
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise RuntimeError(f"本地翻译模型请求失败：HTTP {exc.code} {detail}") from exc
         except (OSError, URLError, json.JSONDecodeError) as exc:
+            self.job.check_cancelled()
             raise RuntimeError(f"无法连接本地翻译模型：{exc}") from exc
         try:
             return str(body["choices"][0]["message"]["content"])
@@ -399,12 +468,7 @@ class LocalLlama:
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+            terminate_process(self.process)
         self.process = None
         if self.log_handle:
             self.log_handle.close()
@@ -443,6 +507,7 @@ def parse_translation_json(raw: str, expected: int) -> list[str]:
 class Job:
     job_id: str
     directory: Path
+    name: str = ""
     status: str = "queued"
     stage: str = "排队中"
     progress: int = 0
@@ -452,9 +517,16 @@ class Job:
     outputs: list[dict[str, str]] = field(default_factory=list)
     error: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise JobCancelled("任务已停止")
 
     def update(self, stage: str, progress: int, message: str) -> None:
         with self.lock:
+            if self.status == "cancelled":
+                return
             self.status = "running"
             self.stage = stage
             self.progress = max(0, min(100, progress))
@@ -466,10 +538,20 @@ class Job:
             if len(self.logs) > 160:
                 self.logs = self.logs[-160:]
 
+    def cancel(self, message: str = "已请求停止") -> None:
+        self.cancel_event.set()
+        with self.lock:
+            if self.status not in {"completed", "failed", "cancelled"}:
+                self.status = "cancelled"
+                self.stage = "已停止"
+                self.message = message
+        self.append_log("任务已停止")
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
                 "id": self.job_id,
+                "name": self.name,
                 "status": self.status,
                 "stage": self.stage,
                 "progress": self.progress,
@@ -483,27 +565,56 @@ class Job:
 
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
+JOB_QUEUE: queue.Queue[tuple[str, Path | None, str, dict[str, str]]] = queue.Queue()
+WHISPER_MODEL: Any | None = None
+WHISPER_MODEL_KEY: tuple[str, str, str] | None = None
+WHISPER_MODEL_LOCK = threading.Lock()
+ACTIVE_LLAMA: LocalLlama | None = None
+ACTIVE_LLAMA_LOCK = threading.Lock()
+
+
+def load_whisper_model(model_ref: str, device: str, compute_type: str, job: Job) -> Any:
+    global WHISPER_MODEL, WHISPER_MODEL_KEY
+    key = (model_ref, device, compute_type)
+    with WHISPER_MODEL_LOCK:
+        job.check_cancelled()
+        if WHISPER_MODEL is not None and WHISPER_MODEL_KEY == key:
+            job.append_log("复用已加载的 Whisper 转写模型")
+            job.update("transcribe", 10, f"复用转写模型：{Path(model_ref).name}")
+            return WHISPER_MODEL
+        if WHISPER_MODEL is not None:
+            job.append_log("转写模型配置变化，释放旧模型后重新加载")
+            WHISPER_MODEL = None
+            WHISPER_MODEL_KEY = None
+            gc.collect()
+        job.update("transcribe", 10, f"加载转写模型：{Path(model_ref).name}")
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError("未安装 faster-whisper，请先运行 start_webui.ps1 安装依赖") from exc
+        try:
+            model = WhisperModel(model_ref, device=device, compute_type=compute_type)
+            actual_key = key
+        except Exception as exc:
+            if device.lower() != "cuda":
+                raise RuntimeError(f"转写模型加载失败：{exc}") from exc
+            job.append_log(f"CUDA 转写不可用，降级 CPU int8：{exc}")
+            model = WhisperModel(model_ref, device="cpu", compute_type="int8")
+            actual_key = (model_ref, "cpu", "int8")
+        job.check_cancelled()
+        WHISPER_MODEL = model
+        WHISPER_MODEL_KEY = actual_key
+        return model
 
 
 def transcribe(audio_path: Path, job: Job, language: str | None, model_value: str = "") -> tuple[list[dict[str, Any]], str]:
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise RuntimeError("未安装 faster-whisper，请先运行 start_webui.ps1 安装依赖") from exc
     model_value = model_value.strip() or str(CONFIG.get("whisper_model", "large-v3-turbo"))
     model_path = expand_path(model_value)
     model_ref = str(model_path) if model_path.exists() else model_value
     requested_device = str(CONFIG.get("whisper_device", "cuda"))
     requested_compute = str(CONFIG.get("whisper_compute_type", "float16"))
-    job.update("transcribe", 10, f"加载转写模型：{Path(model_ref).name}")
-    try:
-        model = WhisperModel(model_ref, device=requested_device, compute_type=requested_compute)
-    except Exception as exc:
-        if requested_device.lower() != "cpu":
-            job.append_log(f"CUDA 转写不可用，降级 CPU int8：{exc}")
-            model = WhisperModel(model_ref, device="cpu", compute_type="int8")
-        else:
-            raise RuntimeError(f"转写模型加载失败：{exc}") from exc
+    model = load_whisper_model(model_ref, requested_device, requested_compute, job)
+    job.check_cancelled()
     segments_iter, info = model.transcribe(
         str(audio_path),
         language=language or None,
@@ -514,6 +625,7 @@ def transcribe(audio_path: Path, job: Job, language: str | None, model_value: st
     detected = getattr(info, "language", "unknown") or "unknown"
     items = []
     for segment in segments_iter:
+        job.check_cancelled()
         text = (getattr(segment, "text", "") or "").strip()
         start = float(getattr(segment, "start", 0.0))
         end = float(getattr(segment, "end", start))
@@ -546,9 +658,11 @@ def download_url(url: str, target_dir: Path, job: Job) -> Path:
 
 
 def run_job(job: Job, input_path: Path | None, url: str, options: dict[str, str]) -> None:
+    global ACTIVE_LLAMA
     model_server: LocalLlama | None = None
     log_path = job.directory / "job.log"
     try:
+        job.check_cancelled()
         job.update("prepare", 3, "准备输入文件")
         video_path = input_path
         if not video_path and url.strip():
@@ -582,6 +696,8 @@ def run_job(job: Job, input_path: Path | None, url: str, options: dict[str, str]
             if not model:
                 raise RuntimeError("未找到所选本地翻译模型，请刷新模型列表后重试")
             model_server = LocalLlama(model, job, log_path)
+            with ACTIVE_LLAMA_LOCK:
+                ACTIVE_LLAMA = model_server
             model_server.start()
             translated_texts = model_server.translate(original, detected)
 
@@ -620,11 +736,18 @@ def run_job(job: Job, input_path: Path | None, url: str, options: dict[str, str]
                 None, job, "burn", log_path,
             )
             job.outputs.append({"name": output_video_path.name, "url": f"/files/{quote(job.job_id)}/{quote(output_video_path.name)}"})
+        job.check_cancelled()
         with job.lock:
             job.status = "completed"
             job.stage = "完成"
             job.progress = 100
             job.message = "本地翻译与输出已完成"
+    except JobCancelled as exc:
+        with job.lock:
+            job.status = "cancelled"
+            job.stage = "已停止"
+            job.message = "任务已停止"
+        job.append_log("任务已停止：" + str(exc))
     except Exception as exc:
         with job.lock:
             job.status = "failed"
@@ -634,6 +757,10 @@ def run_job(job: Job, input_path: Path | None, url: str, options: dict[str, str]
         job.append_log("错误：" + str(exc))
     finally:
         if model_server:
+            with ACTIVE_LLAMA_LOCK:
+                if ACTIVE_LLAMA is model_server:
+                    ACTIVE_LLAMA = None
+        if model_server:
             model_server.stop()
         try:
             audio = job.directory / "audio.wav"
@@ -641,6 +768,34 @@ def run_job(job: Job, input_path: Path | None, url: str, options: dict[str, str]
                 audio.unlink()
         except OSError:
             pass
+
+
+def queue_worker() -> None:
+    while True:
+        job_id, input_path, url, options = JOB_QUEUE.get()
+        try:
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            if job is None or job.cancel_event.is_set():
+                continue
+            run_job(job, input_path, url, options)
+        finally:
+            JOB_QUEUE.task_done()
+
+
+def stop_all_jobs() -> int:
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+    count = 0
+    for job in jobs:
+        if job.status in {"queued", "running"}:
+            job.cancel()
+            count += 1
+    with ACTIVE_LLAMA_LOCK:
+        model_server = ACTIVE_LLAMA
+    if model_server:
+        model_server.stop()
+    return count
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -658,9 +813,10 @@ HTML_PAGE = r"""<!doctype html>
     .card h2 { margin:0 0 16px; font-size:17px; } label { display:block; color:var(--muted); font-size:13px; margin:14px 0 7px; } input[type=text], input[type=url], select { width:100%; border:1px solid var(--line); background:#101217; color:var(--text); padding:11px 12px; border-radius:9px; outline:none; } input:focus, select:focus { border-color:var(--accent2); }
     input[type=file] { width:100%; padding:13px; border:1px dashed #5a6270; border-radius:10px; background:#101217; color:var(--muted); } .hint { color:var(--muted); font-size:12px; margin-top:6px; }
     .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; } .checks { display:flex; flex-wrap:wrap; gap:12px; margin-top:12px; } .check { display:flex; align-items:center; gap:7px; color:var(--text); font-size:14px; } .check input { accent-color:var(--accent2); }
-    button { border:0; border-radius:10px; background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#23170e; font-weight:700; padding:12px 18px; cursor:pointer; } button.secondary { background:#2b313b; color:var(--text); border:1px solid var(--line); } button:disabled { cursor:not-allowed; opacity:.55; }
+    button { border:0; border-radius:10px; background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#23170e; font-weight:700; padding:12px 18px; cursor:pointer; } button.secondary { background:#2b313b; color:var(--text); border:1px solid var(--line); } button.danger { background:#6e2932; color:#fff; border:1px solid #a74856; } button:disabled { cursor:not-allowed; opacity:.55; }
     .actions { display:flex; align-items:center; gap:10px; margin-top:20px; } .status { margin-top:20px; } .progress { height:9px; background:#0e1014; border-radius:99px; overflow:hidden; } .bar { height:100%; width:0; background:linear-gradient(90deg,var(--accent2),var(--accent)); transition:width .25s; }
-    .statusline { display:flex; justify-content:space-between; gap:16px; margin:9px 0; } .stage { color:var(--accent); } .percent { color:var(--muted); } pre { white-space:pre-wrap; max-height:260px; overflow:auto; background:#0e1014; border:1px solid var(--line); padding:12px; border-radius:9px; font:12px/1.45 Consolas, monospace; color:#cbd2dc; } .outputs { display:flex; flex-wrap:wrap; gap:9px; margin-top:12px; } .outputs a { color:#1b1510; background:var(--ok); padding:8px 11px; border-radius:8px; text-decoration:none; font-weight:700; font-size:13px; }
+    .statusline { display:flex; justify-content:space-between; align-items:center; gap:16px; margin:9px 0; } .stage { color:var(--accent); } .percent { color:var(--muted); } pre { white-space:pre-wrap; max-height:260px; overflow:auto; background:#0e1014; border:1px solid var(--line); padding:12px; border-radius:9px; font:12px/1.45 Consolas, monospace; color:#cbd2dc; } .outputs { display:flex; flex-wrap:wrap; gap:9px; margin-top:12px; } .outputs a { color:#1b1510; background:var(--ok); padding:8px 11px; border-radius:8px; text-decoration:none; font-weight:700; font-size:13px; }
+    .task-list { display:flex; flex-direction:column; gap:12px; } .task { border:1px solid var(--line); border-radius:11px; padding:13px; background:#15181d; } .task-head { display:flex; justify-content:space-between; gap:12px; margin-bottom:8px; } .task-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .task-state { color:var(--accent); white-space:nowrap; } .task-state.done { color:var(--ok); } .task-state.bad { color:var(--bad); } .task-progress { height:7px; margin:7px 0; } .task-message { color:var(--muted); font-size:12px; } .task-log { margin-top:9px; max-height:150px; } .empty { color:var(--muted); font-size:13px; padding:12px 0; }
     .full { grid-column:1 / -1; } .note { border-left:3px solid var(--accent2); padding:8px 12px; color:var(--muted); background:#211c1b; border-radius:0 8px 8px 0; font-size:13px; } .small { font-size:12px; color:var(--muted); }
     @media (max-width:800px) { .grid { grid-template-columns:1fr; } .full { grid-column:auto; } header { display:block; } .badge { display:inline-block; margin-top:12px; } .row { grid-template-columns:1fr; } }
   </style>
@@ -671,8 +827,8 @@ HTML_PAGE = r"""<!doctype html>
   <div class="grid">
     <section class="card">
       <h2>① 选择视频</h2>
-      <label for="video">本地视频文件</label><input id="video" type="file" accept="video/*,audio/*">
-      <div class="hint">如果同时填写 URL，将优先使用本地文件。</div>
+      <label for="video">本地视频文件</label><input id="video" type="file" accept="video/*,audio/*" multiple>
+      <div class="hint">可一次选择多个视频，所有任务会自动进入本地队列，按顺序处理。</div>
       <label for="url">视频 URL（可选）</label><input id="url" type="url" placeholder="https://…">
       <div class="note" style="margin-top:15px">所有处理都在本机执行。URL 下载需要本机已安装 yt-dlp，受站点登录、网络与版权条件影响。</div>
     </section>
@@ -690,26 +846,40 @@ HTML_PAGE = r"""<!doctype html>
       <div class="row"><div><label for="source">原语种</label><select id="source"><option value="auto">自动识别</option><option value="en">英语</option><option value="ja">日语</option><option value="ko">韩语</option><option value="fr">法语</option><option value="de">德语</option><option value="es">西班牙语</option><option value="zh">中文</option></select></div><div><label for="mode">字幕模式</label><select id="mode"><option value="zh">中文字幕</option><option value="bilingual">中英双语字幕</option></select></div></div>
       <div class="checks"><label class="check"><input id="outputSubtitle" type="checkbox" checked> 输出字幕文件（SRT）</label><label class="check"><input id="outputVideo" type="checkbox" checked> 输出烧录字幕视频（MP4）</label></div>
       <div class="hint">双语视频使用 ASS 烧录，实现中文大字、原文小字；单语视频使用微软雅黑与黑边样式。</div>
-      <div class="actions"><button id="start" type="button">开始本地翻译</button><span class="small">建议先用 1–2 分钟短片验收模型和字体</span></div>
+      <div class="actions"><button id="start" type="button">加入翻译队列</button><button id="stopAll" class="danger" type="button">停止全部任务</button></div>
+      <div id="queueInfo" class="small" style="margin-top:9px">可连续加入多个视频；GPU 翻译阶段按队列稳定执行。</div>
     </section>
     <section class="card">
-      <h2>任务状态</h2>
-      <div class="statusline"><span id="stage" class="stage">尚未开始</span><span id="percent" class="percent">0%</span></div><div class="progress"><div id="bar" class="bar"></div></div><div id="message" class="hint" style="margin-top:9px">请选择视频后开始</div>
-      <div id="outputs" class="outputs"></div>
-      <pre id="logs">等待任务日志…</pre>
+      <h2>任务队列</h2>
+      <div id="taskList" class="task-list"><div class="empty">尚未提交任务</div></div>
     </section>
     <section class="card full"><h2>本地化边界</h2><div class="small">字幕时间轴来自 Whisper 转写；翻译由所选 GGUF 模型在本机 llama.cpp 中完成；FFmpeg 仅用于提取音频和烧录。渲染完成、接口成功或生成文件不等于人工审核或公开发布，发布前请抽查字幕准确性、专有名词、字体和时间轴。</div></section>
   </div>
 </main>
 <script>
-const $ = id => document.getElementById(id); let currentJob = null; let pollTimer = null;
+const $ = id => document.getElementById(id); let pollTimer = null; const trackedJobs = new Set();
+const terminalStates = new Set(['completed', 'failed', 'cancelled']);
 function setText(id, value) { $(id).textContent = value ?? ''; }
 async function loadConfig() { const r = await fetch('/api/config'); const d = await r.json(); $('whisperModel').value = d.whisper_model; $('outputDir').value = d.output_dir; }
 async function loadModels() { const s=$('model'); s.innerHTML='<option>正在扫描模型…</option>'; const r=await fetch('/api/models'); const d=await r.json(); s.innerHTML=''; if(!d.models.length){s.innerHTML='<option value="">未找到 GGUF 模型</option>'; $('modelInfo').textContent='请检查模型目录'; return;} for(const m of d.models){const o=document.createElement('option');o.value=m.id;o.textContent=m.label;s.appendChild(o);} $('modelInfo').textContent=`共 ${d.models.length} 个可选模型 · 默认优先 Hy-MT2 7B`; }
-function renderJob(d) { $('bar').style.width=d.progress+'%'; setText('percent',d.progress+'%'); setText('stage',d.stage); setText('message',d.message || d.error); $('logs').textContent=(d.logs||[]).join('\n') || '等待任务日志…'; $('logs').scrollTop=$('logs').scrollHeight; $('outputs').innerHTML=''; for(const out of (d.outputs||[])){const a=document.createElement('a');a.href=out.url;a.download=out.name;a.textContent='下载 '+out.name;$('outputs').appendChild(a);} if(d.status==='completed'||d.status==='failed'){ $('start').disabled=false; if(d.status==='failed') $('stage').style.color='var(--bad)'; if(pollTimer){clearInterval(pollTimer);pollTimer=null;} } }
-async function poll(){ if(!currentJob)return; const r=await fetch('/api/status?id='+encodeURIComponent(currentJob)); renderJob(await r.json()); }
-async function startJob(){ if(!$('video').files.length && !$('url').value.trim()){alert('请先选择本地视频或填写视频 URL');return;} if(!$('outputSubtitle').checked&&!$('outputVideo').checked){alert('至少选择一种输出');return;} const fd=new FormData(); if($('video').files.length)fd.append('video',$('video').files[0]); fd.append('url',$('url').value); fd.append('model_id',$('model').value); fd.append('source_language',$('source').value); fd.append('subtitle_mode',$('mode').value); fd.append('output_subtitle',$('outputSubtitle').checked?'1':'0'); fd.append('output_video',$('outputVideo').checked?'1':'0'); fd.append('whisper_model',$('whisperModel').value); fd.append('output_dir',$('outputDir').value); $('start').disabled=true; setText('message','正在提交任务…'); const r=await fetch('/api/translate',{method:'POST',body:fd}); const d=await r.json(); if(!r.ok){alert(d.error||'提交失败');$('start').disabled=false;return;} currentJob=d.id; if(pollTimer)clearInterval(pollTimer); await poll(); pollTimer=setInterval(poll,900); }
-$('refresh').onclick=loadModels; $('start').onclick=startJob; loadConfig(); loadModels();
+function renderTask(d) {
+  let card = document.getElementById('task-'+d.id);
+  if (!card) { card=document.createElement('article'); card.className='task'; card.id='task-'+d.id; card.innerHTML='<div class="task-head"><span class="task-title"></span><span class="task-state"></span></div><div class="progress task-progress"><div class="bar task-bar"></div></div><div class="task-message"></div><div class="outputs task-outputs"></div><pre class="task-log"></pre>'; const empty=$('taskList').querySelector('.empty'); if(empty)empty.remove(); $('taskList').prepend(card); }
+  const state = d.status==='queued' ? '排队中' : (d.status==='cancelled' ? '已停止' : (d.stage || d.status));
+  card.querySelector('.task-title').textContent=d.name || ('任务 '+d.id);
+  card.querySelector('.task-state').textContent=state+' '+(d.progress||0)+'%';
+  card.querySelector('.task-state').className='task-state '+(d.status==='completed'?'done':'')+(d.status==='failed'||d.status==='cancelled'?' bad':'');
+  card.querySelector('.task-bar').style.width=(d.progress||0)+'%';
+  card.querySelector('.task-message').textContent=d.message || d.error || '';
+  card.querySelector('.task-log').textContent=(d.logs||[]).join('\n') || '等待任务日志…';
+  const outputs=card.querySelector('.task-outputs'); outputs.innerHTML=''; for(const out of (d.outputs||[])){const a=document.createElement('a');a.href=out.url;a.download=out.name;a.textContent='下载 '+out.name;outputs.appendChild(a);}
+}
+function ensurePolling() { if(!pollTimer) { poll(); pollTimer=setInterval(poll,900); } }
+async function poll(){ const ids=[...trackedJobs]; if(!ids.length)return; let pending=false; const results=await Promise.all(ids.map(async id=>{try{const r=await fetch('/api/status?id='+encodeURIComponent(id));return await r.json();}catch(error){return {id,status:'failed',stage:'失败',error:'无法读取任务状态：'+error};}})); for(const d of results){renderTask(d);if(!terminalStates.has(d.status))pending=true;} if(!pending&&pollTimer){clearInterval(pollTimer);pollTimer=null;} }
+function makeForm(file, url) { const fd=new FormData(); if(file)fd.append('video',file); fd.append('url',url); fd.append('model_id',$('model').value); fd.append('source_language',$('source').value); fd.append('subtitle_mode',$('mode').value); fd.append('output_subtitle',$('outputSubtitle').checked?'1':'0'); fd.append('output_video',$('outputVideo').checked?'1':'0'); fd.append('whisper_model',$('whisperModel').value); fd.append('output_dir',$('outputDir').value); return fd; }
+async function startJob(){ const files=[...$('video').files]; const url=$('url').value.trim(); if(!files.length&&!url){alert('请先选择本地视频或填写视频 URL');return;} if(!$('outputSubtitle').checked&&!$('outputVideo').checked){alert('至少选择一种输出');return;} $('start').disabled=true; let added=0; try { const items=files.length?files.map(file=>({file,url:''})):[{file:null,url}]; for(const item of items){const r=await fetch('/api/translate',{method:'POST',body:makeForm(item.file,item.url)}); const d=await r.json(); if(!r.ok)throw new Error(d.error||'提交失败'); trackedJobs.add(d.id); renderTask({id:d.id,name:item.file?item.file.name:'URL 视频',status:'queued',stage:'排队中',progress:0,message:'已加入翻译队列'}); added++; } setText('queueInfo',`已加入 ${added} 个任务；GPU 翻译按队列稳定执行。`); $('video').value=''; if(files.length)$('url').value=''; ensurePolling(); } catch(error) { alert(error.message||error); } finally { $('start').disabled=false; } }
+async function stopAll(){ $('stopAll').disabled=true; try { const r=await fetch('/api/stop-all',{method:'POST'}); const d=await r.json(); setText('queueInfo',`已请求停止 ${d.count||0} 个任务。`); await poll(); } catch(error) { alert('停止任务失败：'+error); } finally { $('stopAll').disabled=false; } }
+$('refresh').onclick=loadModels; $('start').onclick=startJob; $('stopAll').onclick=stopAll; loadConfig(); loadModels();
 </script>
 </body></html>"""
 
@@ -783,7 +953,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlparse(self.path).path != "/api/translate":
+        parsed_path = urlparse(self.path).path
+        if parsed_path == "/api/stop-all":
+            json_response(self, {"count": stop_all_jobs(), "message": "已请求停止全部任务"})
+            return
+        if parsed_path != "/api/translate":
             json_response(self, {"error": "接口不存在"}, 404)
             return
         try:
@@ -812,12 +986,11 @@ class Handler(BaseHTTPRequestHandler):
                             out.write(chunk)
             options = {key: str(form.getfirst(key) or "") for key in ("model_id", "source_language", "subtitle_mode", "output_subtitle", "output_video", "whisper_model")}
             url = str(form.getfirst("url") or "")
-            job = Job(job_id, job_dir)
+            job = Job(job_id, job_dir, name=Path(input_path).name if input_path else "URL 视频")
             with JOBS_LOCK:
                 JOBS[job_id] = job
-            thread = threading.Thread(target=run_job, args=(job, input_path, url, options), name=f"video-job-{job_id}", daemon=True)
-            thread.start()
-            json_response(self, {"id": job_id})
+            JOB_QUEUE.put((job_id, input_path, url, options))
+            json_response(self, {"id": job_id, "status": "queued", "message": "已加入翻译队列"})
         except Exception as exc:
             json_response(self, {"error": str(exc)}, 400)
 
@@ -833,6 +1006,8 @@ def main() -> None:
     host = args.host or str(CONFIG.get("host", "127.0.0.1"))
     port = args.port or int(CONFIG.get("port", 8877))
     output = resolved_output_dir()
+    worker = threading.Thread(target=queue_worker, name="video-job-queue", daemon=True)
+    worker.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print("小互本地视频翻译台已启动")
     print(f"浏览器打开：http://{host}:{port}")
