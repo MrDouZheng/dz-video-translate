@@ -1,0 +1,39 @@
+{
+  "output_dir": "~/Documents/video-translate-output",
+  "settings": {
+    "watermark_enabled": false,
+    "watermark_text": "@YourName",
+    "watermark_opacity": 0.28,
+    "watermark_duration": 4,
+    "watermark_fade": 0.5,
+    "watermark_count": 3,
+    "watermark_position": "top-left",
+    "watermark_fontsize": 44,
+    "subtitle_type": "zh"
+  },
+  "secrets": {},
+  "__ui": {
+    "fields": {
+      "output_dir": {
+        "label": "输出根目录",
+        "type": "directory",
+        "required": true,
+        "description": "本技能所有产物的输出根目录。临时文件写入 tmp/；最终 Markdown 写入 data/。",
+        "placeholder": "请选择输出目录…"
+      },
+      "settings.subtitle_type": {
+        "label": "字幕类型",
+        "type": "select",
+        "options": [
+          {"value": "zh", "label": "中文字幕"},
+          {"value": "bilingual", "label": "中英双语字幕"}
+        ],
+        "description": "默认字幕类型。对话中说“双语”可临时覆盖。"
+      }
+    },
+    "order": [
+      "output_dir",
+      "settings.subtitle_type"
+    ]
+  }
+}

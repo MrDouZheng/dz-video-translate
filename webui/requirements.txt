@@ -1,0 +1,2 @@
+# Windows CUDA 路线只需要转写依赖；llama.cpp 与 FFmpeg 使用本机现有程序。
+faster-whisper>=1.1.0,<2.0.0

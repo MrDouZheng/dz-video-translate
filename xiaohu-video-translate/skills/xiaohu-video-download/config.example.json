@@ -1,0 +1,19 @@
+{
+  "output_dir": "~/Downloads",
+  "settings": {},
+  "secrets": {},
+  "__ui": {
+    "fields": {
+      "output_dir": {
+        "label": "输出根目录",
+        "type": "directory",
+        "required": true,
+        "description": "本技能所有产物的输出根目录。脚本会在该目录下创建 tmp/（临时文件）与 data/（最终输出）。",
+        "placeholder": "请选择输出目录…"
+      }
+    },
+    "order": [
+      "output_dir"
+    ]
+  }
+}

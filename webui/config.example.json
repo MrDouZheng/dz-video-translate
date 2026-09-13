@@ -1,0 +1,15 @@
+{
+  "models_dir": "E:\\path\\to\\llama.cpp-hub\\models",
+  "llama_server": "E:\\path\\to\\llama.cpp-hub\\llama-server.exe",
+  "ffmpeg": "ffmpeg",
+  "yt_dlp": "yt-dlp",
+  "whisper_model": "large-v3-turbo",
+  "output_dir": "./data",
+  "host": "127.0.0.1",
+  "port": 8877,
+  "whisper_device": "cuda",
+  "whisper_compute_type": "float16",
+  "llama_context": 8192,
+  "llama_gpu_layers": 99,
+  "translation_batch": 16
+}

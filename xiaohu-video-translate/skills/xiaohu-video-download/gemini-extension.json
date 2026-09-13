@@ -1,0 +1,6 @@
+{
+  "name": "xiaohu-video-download",
+  "version": "1.0.0",
+  "description": "视频下载与处理工具：支持 YouTube/Bilibili/抖音视频下载、音频提取、播放列表批量下载，以及本地视频 AI 烧录中文字幕。",
+  "contextFileName": "SKILL.md"
+}

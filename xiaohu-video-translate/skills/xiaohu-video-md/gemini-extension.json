@@ -1,0 +1,6 @@
+{
+  "name": "xiaohu-video-md",
+  "version": "1.0.0",
+  "description": "视频转写与 Markdown 生成工具：支持字幕抓取或音频转写，生成中文及原文对照的 Markdown 文档。",
+  "contextFileName": "SKILL.md"
+}

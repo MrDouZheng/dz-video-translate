@@ -1,0 +1,20 @@
+# 每个技能的真实配置（含本地输出路径/水印等），用户从 config.example.json 复制生成
+skills/*/config.json
+
+# 运行时产物与中间文件
+skills/*/data/
+skills/*/tmp/
+
+# 浏览器登录态（抖音 cookie 等隐私数据，绝不入库）
+skills/*/data/browser_state/
+**/browser_state/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份与系统文件
+*.bak
+*.bak-*
+.DS_Store
