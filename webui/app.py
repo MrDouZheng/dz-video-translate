@@ -22,6 +22,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -66,6 +67,47 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
 
 
 CONFIG = load_config()
+CUDA_DLL_HANDLES: list[Any] = []
+
+
+def configure_cuda_runtime() -> None:
+    """让 Python 3.8+ 能找到 NVIDIA pip 包里的 CUDA DLL。"""
+    if os.name != "nt":
+        return
+    candidates: list[Path] = []
+    try:
+        import nvidia
+
+        for base in nvidia.__path__:
+            root = Path(base)
+            candidates.extend(
+                [
+                    root / "cublas" / "bin",
+                    root / "cuda_nvrtc" / "bin",
+                    root / "cudnn" / "bin",
+                ]
+            )
+    except (ImportError, AttributeError):
+        pass
+    site_packages = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    candidates.extend(
+        [
+            site_packages / "cublas" / "bin",
+            site_packages / "cuda_nvrtc" / "bin",
+            site_packages / "cudnn" / "bin",
+        ]
+    )
+    seen: set[str] = set()
+    for directory in candidates:
+        key = str(directory).lower()
+        if key in seen or not directory.is_dir():
+            continue
+        seen.add(key)
+        os.environ["PATH"] = str(directory) + os.pathsep + os.environ.get("PATH", "")
+        try:
+            CUDA_DLL_HANDLES.append(os.add_dll_directory(str(directory)))
+        except OSError:
+            continue
 
 
 def expand_path(value: str | Path) -> Path:
@@ -588,6 +630,7 @@ def load_whisper_model(model_ref: str, device: str, compute_type: str, job: Job)
             WHISPER_MODEL_KEY = None
             gc.collect()
         job.update("transcribe", 10, f"加载转写模型：{Path(model_ref).name}")
+        configure_cuda_runtime()
         try:
             from faster_whisper import WhisperModel
         except ImportError as exc:

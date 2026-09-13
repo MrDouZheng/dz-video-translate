@@ -12,6 +12,7 @@
 6. 可选用 FFmpeg 将中文字幕烧录到 MP4；双语模式使用 ASS，中文字号大于原文。
 7. 支持一次选择多个视频并加入本地任务队列；GPU 重任务按顺序执行，避免多个 Whisper/llama 实例抢占显存。
 8. Whisper 模型在同一配置下复用；页面提供“停止全部任务”，可取消排队任务并中止当前 FFmpeg/llama 子进程。
+9. 启动时自动注册 NVIDIA pip CUDA DLL 目录，兼容 Python 3.12 的 `cublas64_12.dll` 加载方式。
 
 ## 启动
 
